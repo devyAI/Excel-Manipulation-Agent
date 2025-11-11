@@ -440,6 +440,10 @@ def derive_column_action(df: pd.DataFrame, target_columns: List[str],
     result_df = df.copy()
     new_col = parameters.get('new_column')
     formula = parameters.get('formula')
+    safe_formula = formula
+    for col in target_columns:
+        safe_formula = safe_formula.replace(col,f"df['{col}']")
+
     
     if not new_col:
         st.warning("derive_column action requires a 'new_column' parameter")
@@ -464,7 +468,7 @@ def derive_column_action(df: pd.DataFrame, target_columns: List[str],
             result_df[new_col] = None
         
         # Evaluate formula - it should return a Series or array
-        derived_values = eval(formula, context)
+        derived_values = eval(safe_formula, context)
         
         # Apply to the specified row range
         if isinstance(derived_values, pd.Series):
