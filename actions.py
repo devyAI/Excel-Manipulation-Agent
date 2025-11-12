@@ -8,6 +8,7 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 from typing import List, Dict, Any, Optional, Tuple
+import re
 
 
 def _get_row_indices(df: pd.DataFrame, row_range: Optional[Dict[str, int]]) -> slice:
@@ -25,98 +26,174 @@ def _get_row_indices(df: pd.DataFrame, row_range: Optional[Dict[str, int]]) -> s
     return slice(row_range['start'], row_range['end'])
 
 
-def set_value_action(df: pd.DataFrame, target_columns: List[str], 
-                     parameters: Dict[str, Any], conditions: Optional[str] = None,
-                     row_range: Optional[Dict[str, int]] = None) -> pd.DataFrame:
-    """Set values in target columns.
-    
+def set_value_action(df: pd.DataFrame,
+                     target_columns,
+                     parameters,
+                     conditions=None,
+                     row_range=None) -> pd.DataFrame:
+    """
+    Sets specific column values based on an optional condition.
+
     Args:
         df: Input DataFrame
         target_columns: List of column names to modify
-        parameters: Dict containing 'value' key
-        conditions: Optional condition string to match before setting value
-        row_range: Optional dict with 'start' and 'end' keys to specify row range
-        
+        parameters: Dict containing 'value'
+        conditions: Optional string condition (e.g., "FirstName-1 == 'Charlie'")
+        row_range: Optional dict with 'start' and 'end' keys
+
     Returns:
-        Modified DataFrame
+        Updated DataFrame
     """
     result_df = df.copy()
-    value = parameters.get('value')
-    
+    value = parameters.get("value", None)
+
     if value is None:
-        st.warning("set_value action requires a 'value' parameter")
+        print("⚠️ 'set_value' action missing 'value' parameter.")
         return result_df
-    
-    # Get row slice
-    row_slice = _get_row_indices(result_df, row_range)
-    
-    for col in target_columns:
-        if col not in result_df.columns:
-            continue
-        
-        if conditions:
-            # Apply condition: set value only if current value matches condition
-            # But only within the specified row range
-            mask = (result_df.loc[row_slice, col] == conditions)
-            # Where mask is True, set to value; where False, keep original
-            # Use .mask() which is the inverse of .where()
-            result_df.loc[row_slice, col] = result_df.loc[row_slice, col].mask(mask, value)
-        else:
-            # Set values in the specified row range
-            result_df.loc[row_slice, col] = value
-    
-    return result_df
 
-
-def update_action(df: pd.DataFrame, target_columns: List[str],
-                  parameters: Dict[str, Any], conditions: Optional[str] = None,
-                  row_range: Optional[Dict[str, int]] = None) -> pd.DataFrame:
-    """Update columns using a formula.
-    
-    Args:
-        df: Input DataFrame
-        target_columns: List of column names to modify
-        parameters: Dict containing 'formula' key
-        conditions: Optional condition string (not used in current implementation)
-        row_range: Optional dict with 'start' and 'end' keys to specify row range
-        
-    Returns:
-        Modified DataFrame
-    """
-    result_df = df.copy()
-    formula = parameters.get('formula')
-    
-    if not formula:
-        st.warning("update action requires a 'formula' parameter")
-        return result_df
-    
-    # Get row slice
-    row_slice = _get_row_indices(result_df, row_range)
-    
     try:
+        # If a condition is provided, create a boolean mask
+        if conditions:
+            mask = result_df.eval(conditions)
+        else:
+            mask = pd.Series(True, index=result_df.index)
+
+        # Apply to row range if provided
+        if row_range:
+            start = row_range.get("start", 0)
+            end = row_range.get("end", len(result_df))
+            mask.iloc[:start] = False
+            mask.iloc[end:] = False
+
+        # Apply update
         for col in target_columns:
             if col not in result_df.columns:
+                print(f"⚠️ Column '{col}' not found in DataFrame.")
                 continue
-            # Evaluate formula with safe context
-            # Note: Using eval is not ideal for production - consider safer alternatives
-            context = {'df': result_df, 'col': col, 'pd': pd, 'np': np}
-            # Evaluate formula - it should return a Series or array
-            formula_result = eval(formula, context)
-            
-            # Apply to the specified row range
-            if isinstance(formula_result, pd.Series):
-                result_df.loc[row_slice, col] = formula_result.loc[row_slice]
-            elif hasattr(formula_result, '__getitem__'):
-                # Array-like object
-                result_df.loc[row_slice, col] = formula_result[row_slice]
-            else:
-                # Scalar or other type - apply to all rows in range
-                result_df.loc[row_slice, col] = formula_result
+            result_df.loc[mask, col] = value
+
+        print(f"✅ Successfully updated {target_columns} where {conditions or 'all rows'}.")
+
     except Exception as e:
-        st.error(f"Error evaluating formula: {str(e)}")
-    
+        print(f"❌ Error while applying condition '{conditions}': {e}")
+
     return result_df
 
+def _make_formula_safe(expr: str, df: pd.DataFrame) -> str:
+    """
+    Replace plain column references (like Accidents-1) with df["Accidents-1"]
+    so that eval() won't fail on column names with hyphens or spaces.
+    """
+    for col in df.columns:
+        safe_col = re.escape(col)
+        expr = re.sub(fr'\b{safe_col}\b', f'df["{col}"]', expr)
+    return expr
+
+
+def _fix_condition_syntax(expr: str) -> str:
+    """
+    Fixes assignment-like conditions (e.g. '=') to '==' for comparisons.
+    Avoids replacing inside quotes or already correct expressions.
+    """
+    # Replace single = with == when not part of >=, <=, ==, or inside quotes
+    def replacer(match):
+        text = match.group(0)
+        if '"' in text or "'" in text:
+            return text
+        return text.replace(" = ", " == ")
+    
+    expr = re.sub(r'(?<![<>=!])=(?!=)', '==', expr)  # replace lone =
+    return expr
+
+
+def update_action(
+    df: pd.DataFrame, 
+    target_columns: list, 
+    parameters: dict, 
+    conditions: str = None, 
+    row_range: dict = None
+) -> pd.DataFrame:
+    """
+    Enhanced update handler:
+    - Supports both formula and value updates.
+    - Handles '=' vs '==' automatically.
+    - Works with conditional updates and row ranges.
+    - Safely handles column names with spaces/hyphens.
+    """
+    result_df = df.copy()
+    formula = parameters.get("formula")
+    value = parameters.get("value")
+
+    # Neither formula nor value provided
+    if not formula and value is None:
+        st.warning("No formula or value provided in parameters")
+        return result_df
+
+    # Prepare condition
+    if conditions:
+        conditions = _fix_condition_syntax(conditions)
+        conditions = _make_formula_safe(conditions, result_df)
+
+    # Handle row range if provided
+    if row_range:
+        start, end = row_range.get("start", 0), row_range.get("end", len(result_df))
+        range_mask = pd.Series(False, index=result_df.index)
+        range_mask.iloc[start:end] = True
+    else:
+        range_mask = pd.Series(True, index=result_df.index)
+
+    for col in target_columns:
+        if col not in result_df.columns:
+            st.warning(f"Column '{col}' not found")
+            continue
+
+        try:
+            # Create condition mask
+            if conditions:
+                try:
+                    mask = eval(conditions, {"__builtins__": {}}, {'df': result_df, 'pd': pd, 'np': np})
+                    if not isinstance(mask, pd.Series):
+                        st.warning(f"Condition '{conditions}' did not produce a valid mask.")
+                        continue
+                except Exception as e:
+                    st.error(f"Error evaluating condition '{conditions}': {str(e)}")
+                    continue
+            else:
+                mask = pd.Series(True, index=result_df.index)
+
+            mask = mask & range_mask
+
+            if not mask.any():
+                st.warning(f"No rows match conditions for column '{col}'")
+                continue
+
+            # Evaluation context
+            context = {
+                'df': result_df,
+                'pd': pd,
+                'np': np,
+                'value': result_df.loc[mask, col],
+            }
+
+            if formula:
+                safe_formula = _make_formula_safe(formula, result_df)
+                try:
+                    new_values = eval(safe_formula, {"__builtins__": {}}, context)
+                    result_df.loc[mask, col] = new_values
+                except Exception as e:
+                    st.error(f"Error applying formula to column '{col}': {str(e)}")
+            elif value is not None:
+                # Auto-handle string literals
+                if isinstance(value, str):
+                    result_df.loc[mask, col] = value
+                else:
+                    result_df.loc[mask, col] = value
+
+        except Exception as e:
+            st.error(f"Error processing column '{col}': {str(e)}")
+            continue
+
+    return result_df
 
 def filter_action(df: pd.DataFrame, target_columns: List[str],
                   parameters: Dict[str, Any], conditions: Optional[str] = None,
